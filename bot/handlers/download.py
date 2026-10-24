@@ -6,6 +6,7 @@ import html
 import logging
 import os
 import time
+from collections import deque
 
 from aiogram import F, Router
 from aiogram.fsm.context import FSMContext
@@ -37,9 +38,15 @@ router = Router()
 # минимальный интервал обновления прогресса (Telegram лимит ~30 ред/мин)
 PROGRESS_UPDATE_INTERVAL = 4
 
-# троттлинг алертов о fallback (одно сообщение раз в N секунд)
-_FALLBACK_ALERT_THROTTLE = 600  # 10 минут
-_last_fallback_alert: dict[str, float] = {}
+# алерт админу только при массовом сбое: столько провалов цепочки за окно
+_MASS_FAILURE_THRESHOLD = 5
+_MASS_FAILURE_WINDOW = 15 * 60  # 15 минут
+# после алерта молчим, чтобы при долгой аварии не заспамить админа
+_MASS_ALERT_SILENCE = 60 * 60  # 1 час
+
+# провалы цепочек за последнее окно: (время, [(источник, ошибка, категория), ...])
+_recent_failures: deque = deque()
+_last_mass_alert = 0.0
 
 # человеко-понятные подписи к категориям ошибок
 _ERROR_CATEGORY_LABELS = {
@@ -48,27 +55,23 @@ _ERROR_CATEGORY_LABELS = {
     "expired_url": "Протухшая ссылка на видео (403) — n-challenge или PO-token",
     "no_formats": "Форматы не извлеклись — проверь deno (JS-рантайм) и bgutil (PO-token)",
     "age_restricted": "Возрастное ограничение — нужны cookies залогиненного аккаунта",
+    "soft_block": "«This video is not available» — мягкая блокировка IP",
     "network": "Сетевая ошибка (таймаут или 5xx у прокси/CDN)",
     "geo_blocked": "Видео заблокировано по стране или правообладателем",
     "unavailable": "Видео недоступно (приват/удалено)",
     "unknown": "Неизвестная ошибка",
 }
 
-# категории которые не алертим админу — это ошибки на стороне контента, не инфраструктуры
-_SILENT_CATEGORIES = {"unavailable", "geo_blocked"}
+# если хоть одна попытка вернула это — проблема в самом ролике, а не в боте.
+# такие провалы в счётчик массового сбоя не идут
+_SILENT_CATEGORIES = {"unavailable", "geo_blocked", "age_restricted", "soft_block"}
 
-# что важнее показать админу, когда упало несколько источников с разными ошибками
-_CATEGORY_PRIORITY = [
-    "no_formats",
-    "ip_blocked",
-    "cookies_expired",
-    "network",
-    "expired_url",
-    "unknown",
-    "age_restricted",
-    "geo_blocked",
-    "unavailable",
-]
+# протухшие cookies падают в КАЖДОЙ цепочке (последний шаг) — это известно,
+# поэтому из сводки их выкидываем, иначе забивают её собой
+_IGNORED_CATEGORIES = {"cookies_expired"}
+
+# если в сводке больше всего этих ошибок — скорее всего устарел yt-dlp
+_STALE_YTDLP_CATEGORIES = {"no_formats", "expired_url"}
 
 # максимум 30 одновременных скачиваний — сервер мощный (8ГБ ОЗУ, 6.4ГБ свободно)
 _download_semaphore = asyncio.Semaphore(30)
@@ -559,67 +562,84 @@ async def _restart_warp_silently(endpoint: str) -> None:
 
 
 def _on_all_failed(failures: list[tuple[str, str]]) -> None:
-    """Sync callback: провалилась вся цепочка попыток. Шедулит один алерт админу."""
+    """Sync callback: провалилась вся цепочка попыток.
+    Один провал админу не шлём — копим в окне и алертим только при массовом сбое.
+    """
+    global _last_mass_alert
     if _bot_ref is None or not failures:
         return
+
+    classified = [(src, err, classify_error(err)) for src, err in failures]
+
+    # проблема в самом ролике (приват, гео-блок, возраст) — бот тут ни при чём
+    video_issue = {c for _, _, c in classified} & _SILENT_CATEGORIES
+    if video_issue:
+        logger.info(
+            "Скачивание провалилось из-за ролика (%s) — в счётчик сбоев не берём",
+            ", ".join(sorted(video_issue)),
+        )
+        return
+
+    # cookies выкидываем из сводки (если вдруг кроме них ничего нет — оставляем как есть)
+    classified = [x for x in classified if x[2] not in _IGNORED_CATEGORIES] or classified
+
+    now = time.time()
+    _recent_failures.append((now, classified))
+    while now - _recent_failures[0][0] > _MASS_FAILURE_WINDOW:
+        _recent_failures.popleft()
+
+    logger.info(
+        "Провал цепочки: %d из %d за последние %d мин",
+        len(_recent_failures), _MASS_FAILURE_THRESHOLD, _MASS_FAILURE_WINDOW // 60,
+    )
+    if len(_recent_failures) < _MASS_FAILURE_THRESHOLD:
+        return
+    if now - _last_mass_alert < _MASS_ALERT_SILENCE:
+        return
+    _last_mass_alert = now
+
     try:
-        asyncio.create_task(_send_failure_alert(failures))
+        asyncio.create_task(_send_mass_failure_alert(list(_recent_failures)))
     except RuntimeError:
         # нет активного event loop — игнорируем
         pass
 
 
-async def _send_failure_alert(failures: list[tuple[str, str]]) -> None:
-    """Один алерт админу со сводкой по всей провалившейся цепочке. С троттлингом."""
-    classified = [(src, err, classify_error(err)) for src, err in failures]
-    categories = {c for _, _, c in classified}
-
-    # если хоть одна попытка упёрлась в контент (гео-блок, копирайт, приват) —
-    # видео и не скачается ничем, а бот-детект на другом IP тут вторичен
-    content_issue = categories & _SILENT_CATEGORIES
-    if content_issue:
-        logger.info(
-            "Скачивание провалилось по контенту (%s) — алерт не шлём",
-            ", ".join(sorted(content_issue)),
-        )
-        return
-
-    main_category = next((c for c in _CATEGORY_PRIORITY if c in categories), "unknown")
-
-    now = time.time()
-    last = _last_fallback_alert.get(main_category, 0)
-    if now - last < _FALLBACK_ALERT_THROTTLE:
-        return
-    _last_fallback_alert[main_category] = now
-
-    # сводка: сколько попыток и что вернула каждая (одинаковые схлопываем — пул даёт повторы)
-    seen: dict[str, int] = {}
-    for src, _, cat in classified:
-        key = f"{src}|{cat}"
-        seen[key] = seen.get(key, 0) + 1
+async def _send_mass_failure_alert(window: list) -> None:
+    """Один алерт админу о массовом сбое: какие ошибки давали попытки за окно."""
+    # считаем ошибки по всем попыткам всех провалившихся цепочек
+    counts: dict[str, int] = {}
+    for _, attempts in window:
+        for _, _, cat in attempts:
+            counts[cat] = counts.get(cat, 0) + 1
+    top = sorted(counts.items(), key=lambda x: -x[1])
     lines = "\n".join(
-        f"• <b>{key.split('|')[0]}</b>{f' ×{n}' if n > 1 else ''} — "
-        f"{_ERROR_CATEGORY_LABELS.get(key.split('|')[1], key.split('|')[1])}"
-        for key, n in seen.items()
+        f"• {_ERROR_CATEGORY_LABELS.get(cat, cat)} — ×{n}" for cat, n in top
     )
+
+    hint = ""
+    if top and top[0][0] in _STALE_YTDLP_CATEGORIES:
+        hint = f"\n\n{E['bulb']} Похоже, устарел yt-dlp — пересобери бота с --no-cache"
 
     # текст последней ошибки — по ней обычно и понятно, что чинить
     # экранируем: в ошибках бывают URL с & и <, Telegram на них ругается и не шлёт сообщение
-    last_error = classified[-1][1]
+    last_error = window[-1][1][-1][1]
     short_error = last_error[:300] + "..." if len(last_error) > 300 else last_error
     short_error = html.escape(short_error)
 
     text = (
-        f"{E['warning']} <b>Скачивание провалилось</b>\n"
-        f"<i>Не сработала ни одна попытка ({len(classified)} шт.)</i>\n\n"
-        f"{lines}\n\n"
+        f"{E['warning']} <b>Массовый сбой скачивания</b>\n"
+        f"<i>Не скачалось роликов: {len(window)} за {_MASS_FAILURE_WINDOW // 60} мин</i>\n\n"
+        f"<b>Ошибки попыток:</b>\n{lines}\n\n"
         f"<b>Последняя ошибка:</b>\n<code>{short_error}</code>"
+        f"{hint}\n\n"
+        f"<i>Следующий алерт — не раньше чем через {_MASS_ALERT_SILENCE // 60} мин</i>"
     )
 
     for admin_id in settings.admin_id_list:
         try:
             await _bot_ref.send_message(admin_id, text, parse_mode="HTML")
-            logger.info("Админ %s уведомлён о провале цепочки (%s)", admin_id, main_category)
+            logger.info("Админ %s уведомлён о массовом сбое (%d провалов)", admin_id, len(window))
         except Exception as e:
             logger.warning("Не удалось уведомить админа %s: %s", admin_id, e)
 

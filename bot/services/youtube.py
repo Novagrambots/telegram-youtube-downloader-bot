@@ -658,45 +658,106 @@ class YouTubeDownloader:
             for f in info.get("formats") or []
         )
 
+    # ступени качества YouTube (по короткой стороне кадра)
+    _QUALITY_TIERS = [144, 240, 360, 480, 720, 1080, 1440, 2160]
+    # какие ступени показываем кнопками (2160 не показываем — не влезет в лимит)
+    _SHOWN_TIERS = [360, 480, 720, 1080, 1440]
+    # 144/240 — только если выше ничего нет (старые ролики), иначе лишние кнопки у всех
+    _LOW_TIERS = [144, 240]
+
+    @classmethod
+    def _quality_tier(cls, short_side: int) -> int | None:
+        """Округляет короткую сторону ВВЕРХ до ступени YouTube: 356 → 360, 712 → 720.
+        У роликов с чёрными полосами (letterbox) высота чуть меньше ступени, и точное
+        сравнение их не находило — юзер видел заглушку 360/720 даже у 1080p-ролика.
+        None — больше 4K.
+        """
+        for tier in cls._QUALITY_TIERS:
+            if short_side <= tier:
+                return tier
+        return None
+
+    @classmethod
+    def _quality_format(cls, quality: str) -> str:
+        """Строка формата yt-dlp для кнопки «{quality}p» — та же ступень, что на кнопке.
+
+        Ступень = короткая сторона кадра в (предыдущая ступень, quality]. В фильтрах
+        yt-dlp нельзя написать min(w, h), поэтому две ветки: горизонтальный кадр
+        (короткая сторона — height) и вертикальный (короткая — width). Условие
+        «другая сторона > prev» отсекает чужую ориентацию. Так попадают и шортсы
+        (720x1280 → 720p), и кино 2.39:1 (854x356 → 360p) — раньше для него
+        фильтр «обе стороны <= 2*quality» не находил ничего и качал максимум.
+        """
+        height = int(quality)
+        lower = [t for t in cls._QUALITY_TIERS if t < height]
+        prev = lower[-1] if lower else 0
+        landscape = f"[height>{prev}][height<={height}][width>{prev}]"
+        portrait = f"[width>{prev}][width<={height}][height>{prev}]"
+        # старый фильтр (обе стороны <= 2*quality): может взять ступень пониже, но не выше
+        cap = f"[height<={height * 2}][width<={height * 2}]"
+        avc = "[vcodec~='^(avc|h264)']"
+        return "/".join([
+            # H.264 приоритетнее: его Telegram играет везде (VP9/AV1 в mp4 — не на всех клиентах).
+            # Порядок как раньше: если в ступени нет H.264, берём H.264 ступенью ниже (cap)
+            f"bestvideo{landscape}{avc}+bestaudio[ext=m4a]",
+            f"bestvideo{portrait}{avc}+bestaudio[ext=m4a]",
+            f"bestvideo{cap}{avc}+bestaudio[ext=m4a]",
+            f"bestvideo{landscape}+bestaudio",
+            f"bestvideo{portrait}+bestaudio",
+            f"bestvideo{cap}+bestaudio",
+            f"best{landscape}",
+            f"best{portrait}",
+            f"best{cap}",
+            # хвост без ограничений: если не нашлось ничего (например, видео выложено
+            # только в 4K), лучше отдать доступное качество, чем уронить скачивание
+            # в "Requested format is not available"
+            "bestvideo+bestaudio",
+            "best",
+        ])
+
+    @staticmethod
+    def _estimate_size(fmt: dict, duration: int) -> int:
+        """Размер формата в байтах: точный, примерный или по битрейту. 0 — неизвестно."""
+        size = fmt.get("filesize") or fmt.get("filesize_approx") or 0
+        if not size and fmt.get("tbr") and duration:
+            size = int(fmt["tbr"] * 1000 / 8 * duration)
+        return size
+
     def _parse_qualities(self, info: dict) -> dict:
         formats = info.get("formats", [])
         duration = info.get("duration", 0) or 0
-        target_heights = [360, 480, 720, 1080, 1440]
-        result = {}
 
-        audio_size = 0
+        # самая большая аудиодорожка — её добавим к каждому качеству видео
+        audio_size = max(
+            (self._estimate_size(f, duration) for f in formats
+             if f.get("vcodec", "none") == "none" and f.get("acodec", "none") != "none"),
+            default=0,
+        )
+
+        # самый большой видеоформат на каждой ступени
+        best_by_tier: dict[int, int] = {}
         for fmt in formats:
-            if fmt.get("vcodec", "none") != "none":
+            if fmt.get("vcodec", "none") == "none":
                 continue
-            if fmt.get("acodec", "none") == "none":
+            fmt_h = fmt.get("height") or 0
+            fmt_w = fmt.get("width") or 0
+            short_side = min(fmt_h, fmt_w) if fmt_w else fmt_h
+            if short_side <= 0:
                 continue
-            size = fmt.get("filesize") or fmt.get("filesize_approx") or 0
-            if not size and fmt.get("tbr") and duration:
-                size = int(fmt["tbr"] * 1000 / 8 * duration)
-            if size > audio_size:
-                audio_size = size
+            tier = self._quality_tier(short_side)
+            if tier is None:
+                continue
+            size = self._estimate_size(fmt, duration)
+            if size > best_by_tier.get(tier, 0):
+                best_by_tier[tier] = size
 
-        for h in target_heights:
-            best_size = 0
-            for fmt in formats:
-                fmt_h = fmt.get("height") or 0
-                fmt_w = fmt.get("width") or 0
-                short_side = min(fmt_h, fmt_w) if fmt_w else fmt_h
-                if short_side != h:
-                    continue
-                if fmt.get("vcodec", "none") == "none":
-                    continue
-                size = fmt.get("filesize") or fmt.get("filesize_approx") or 0
-                if not size and fmt.get("tbr") and duration:
-                    size = int(fmt["tbr"] * 1000 / 8 * duration)
-                if size > best_size:
-                    best_size = size
+        def collect(tiers: list[int]) -> dict:
+            return {
+                str(h): max(int((best_by_tier[h] + audio_size) / 1024 / 1024), 1)
+                for h in tiers if best_by_tier.get(h, 0) > 0
+            }
 
-            if best_size > 0:
-                total = best_size + audio_size
-                total_mb = int(total / 1024 / 1024)
-                result[str(h)] = max(total_mb, 1)
-
+        result = collect(self._SHOWN_TIERS) or collect(self._LOW_TIERS)
         if not result:
             result = {"360": 0, "720": 0}
 
@@ -814,27 +875,10 @@ class YouTubeDownloader:
         opts: dict = None,
     ) -> DownloadResult:
         output_template = os.path.join(self.download_dir, f"%(id)s_{quality}p.%(ext)s")
-        height = int(quality)
-        # YouTube помечает качество по КОРОТКОЙ стороне (720p шортса = 720x1280).
-        # По height фильтровать нельзя: у вертикальных видео height — это длинная
-        # сторона, и height<=720 роняет 720p-шортс до 360p. Ограничиваем ДЛИННУЮ
-        # сторону (обе стороны <= 2*target) — так нужный тир корректно отделяется
-        # и в landscape, и в портрете (тиры YouTube по длинной стороне разнесены >2x).
-        cap = height * 2
-        format_str = (
-            f"bestvideo[height<={cap}][width<={cap}][vcodec~='^(avc|h264)']+bestaudio[ext=m4a]"
-            f"/bestvideo[height<={cap}][width<={cap}]+bestaudio"
-            f"/best[height<={cap}][width<={cap}]"
-            # хвост без ограничений: если под cap не нашлось ничего (например, видео
-            # выложено только в 4K), лучше отдать доступное качество, чем уронить
-            # скачивание в "Requested format is not available"
-            f"/bestvideo+bestaudio"
-            f"/best"
-        )
 
         ydl_opts = {
             **opts,
-            "format": format_str,
+            "format": self._quality_format(quality),
             "outtmpl": output_template,
             "merge_output_format": "mp4",
             # обложка ролика — основной источник превью (кадр из видео бывает чёрным)

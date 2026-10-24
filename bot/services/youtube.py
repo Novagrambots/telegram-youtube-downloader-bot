@@ -69,7 +69,7 @@ _CONTENT_CATEGORIES = {"unavailable", "geo_blocked"}
 
 def classify_error(error_msg: str) -> str:
     """Классифицирует ошибку yt-dlp в категорию для осмысленных алертов.
-    Возвращает: 'geo_blocked', 'unavailable', 'age_restricted', 'ip_blocked',
+    Возвращает: 'geo_blocked', 'unavailable', 'age_restricted', 'soft_block', 'ip_blocked',
     'no_formats', 'expired_url', 'cookies_expired', 'network', 'unknown'.
     Порядок проверок важен — сначала контентные ошибки, потом инфраструктурные.
     """
@@ -117,6 +117,12 @@ def classify_error(error_msg: str) -> str:
     ):
         return "age_restricted"
 
+    # 3.1. "This video is not available" — похоже на контент, но НЕ он: по логам
+    # 61% таких роликов в итоге скачались через другой источник. Это мягкая блокировка IP,
+    # поэтому в _CONTENT_CATEGORIES её не добавляем — fallback должен идти дальше
+    if "this video is not available" in msg:
+        return "soft_block"
+
     # 4. YouTube задетектил бота — IP реально забанен, лечится сменой IP (ротацией пула WARP).
     # "sign in to confirm you're not a bot" — это именно бот-детект, а не протухшие куки
     # (на WARP/прокси мы вообще без куки ходим, так что "cookies_expired" там невозможен)
@@ -148,8 +154,13 @@ def classify_error(error_msg: str) -> str:
     if "403" in msg or "forbidden" in msg:
         return "expired_url"
 
-    # 7. cookies протухли (только когда реально использовались куки)
-    if "login required" in msg or "cookies" in msg:
+    # 7. cookies протухли (только когда реально использовались куки).
+    # "page needs to be reloaded" — так YouTube отвечает на мёртвую сессию в cookies
+    if (
+        "login required" in msg
+        or "cookies" in msg
+        or "page needs to be reloaded" in msg
+    ):
         return "cookies_expired"
 
     # 8. сеть и транзиентные сбои прокси/CDN (5xx — нода прокси или googlevideo моргнули)

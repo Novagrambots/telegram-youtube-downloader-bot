@@ -13,9 +13,14 @@ import argparse
 import asyncio
 import logging
 import os
+import sys
 import time
 from collections import Counter
 from importlib import metadata
+
+# через `docker compose exec -T` терминала нет и Python копит вывод до конца прогона —
+# включаем построчный вывод, чтобы прогресс было видно сразу
+sys.stdout.reconfigure(line_buffering=True)
 
 
 class _Collector(logging.Handler):
@@ -186,6 +191,11 @@ async def check_environment() -> list[str]:
         except metadata.PackageNotFoundError:
             print(f"  {pkg:28} НЕ УСТАНОВЛЕН")
             problems.append(f"не установлен {pkg}")
+
+    # yt-dlp грузит плагины (bgutil) при первом создании YoutubeDL. Если это случится
+    # сразу в 4 потоках — гонка и "PoTokenProvider already registered". Грузим заранее, в одном
+    import yt_dlp
+    yt_dlp.YoutubeDL({"quiet": True, "logger": logging.getLogger("bot.prod_check")})
 
     start = len(collector.records)
     await downloader.check_pot_provider()

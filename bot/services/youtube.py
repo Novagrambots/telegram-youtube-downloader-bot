@@ -553,9 +553,9 @@ class YouTubeDownloader:
 
     async def get_info(self, url: str) -> VideoInfo:
         """Получает метаданные видео (лёгкий запрос — только форматы).
-        Если задан резидентный SOCKS5-прокси, идём через него первым: на датацентровых
-        IP WARP YouTube отдаёт УРЕЗАННЫЙ список качеств, из-за чего юзер видел разный
-        набор кнопок. Без прокси — через WARP-пул (PO-token частично компенсирует).
+        С PO-token идём WARP-пулом первым, без него — через резидентный прокси (см. ниже).
+        Ответ без форматов (бот-детект, 429) тоже считается неудачей → пробуем следующий
+        источник. Если форматов не дал никто — отдаём что есть, как раньше (заглушка 360/720).
         Таймауты здесь короче, чем при скачивании: метаданные лёгкие, а долгий get_info
         задерживает показ кнопок качества.
         """
@@ -584,6 +584,10 @@ class YouTubeDownloader:
         source = ""
         last_err: Exception | None = None
         failures: list[tuple[str, str]] = []
+        # ответ без форматов — запоминаем на случай, если лучше не даст никто
+        empty_info = None
+        empty_source = ""
+        empty_tries = 0
         for name, thunk in attempts:
             opts = {
                 **thunk(),
@@ -594,9 +598,7 @@ class YouTubeDownloader:
                 "retries": 1,
             }
             try:
-                info = await loop.run_in_executor(None, self._extract_info, url, opts)
-                source = name
-                break
+                result = await loop.run_in_executor(None, self._extract_info, url, opts)
             except Exception as e:
                 last_err = e
                 # ошибка на стороне контента (приват/гео-блок) — fallback'и не помогут
@@ -605,6 +607,24 @@ class YouTubeDownloader:
                 logger.warning("%s не дал инфо: %s", name, e)
                 failures.append((name, str(e)))
                 self._note_attempt_failure(name, opts, e)
+                continue
+
+            # из-за ignore_no_formats_error бот-детект и 429 приходят не ошибкой, а инфо
+            # БЕЗ форматов. Раньше это считалось успехом → юзер видел заглушку 360/720,
+            # а до следующего источника дело не доходило. Теперь идём дальше по цепочке
+            if not result.get("is_live") and not self._has_media_formats(result):
+                empty_tries += 1
+                logger.warning("%s дал инфо без форматов — пробую следующий источник", name)
+                if empty_info is None:
+                    empty_info, empty_source = result, name
+                continue
+
+            info, source = result, name
+            break
+
+        if info is None and empty_info is not None:
+            # форматов не дал никто — как раньше, отдаём что есть (будет заглушка 360/720)
+            info, source = empty_info, f"{empty_source}(empty)"
 
         if info is None:
             # инфо не дал никто — один алерт со сводкой
@@ -613,8 +633,8 @@ class YouTubeDownloader:
 
         elapsed = time.monotonic() - t_start
         logger.info(
-            "[METRIC] get_info %.2fs source=%s routing=%s url=%s",
-            elapsed, source, routing, url,
+            "[METRIC] get_info %.2fs source=%s routing=%s empty=%d url=%s",
+            elapsed, source, routing, empty_tries, url,
         )
 
         qualities = self._parse_qualities(info)
@@ -626,6 +646,16 @@ class YouTubeDownloader:
             uploader=info.get("uploader"),
             qualities=qualities,
             is_live=bool(info.get("is_live")),
+        )
+
+    @staticmethod
+    def _has_media_formats(info: dict) -> bool:
+        """Есть ли хоть один настоящий формат. Storyboard-картинки (vcodec и acodec = none)
+        не считаются — при бот-детекте YouTube часто отдаёт только их ("Only images are available").
+        """
+        return any(
+            f.get("vcodec", "none") != "none" or f.get("acodec", "none") != "none"
+            for f in info.get("formats") or []
         )
 
     def _parse_qualities(self, info: dict) -> dict:

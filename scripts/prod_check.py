@@ -354,14 +354,20 @@ async def check_downloads(rows: list[dict], count: int) -> list[dict]:
         except asyncio.TimeoutError:
             res_row.update(ok=False, category="timeout", error=f"таймаут {DOWNLOAD_TIMEOUT}с")
         except Exception as e:
-            res_row.update(ok=False, category=classify_error(str(e)), error=str(e))
+            category = classify_error(str(e))
+            # ролик удалён/заблокирован правообладателем — бот не виноват, это не сбой
+            res_row.update(ok=category in VIDEO_SIDE, skipped=category in VIDEO_SIDE,
+                           category=category, error=str(e))
         finally:
             if result:
                 downloader.cleanup(result)
         res_row["sec"] = time.monotonic() - t0
 
         head = f"[{i + 1:2}/{len(candidates)}] {'OK  ' if res_row['ok'] else 'FAIL'} {res_row['sec']:5.1f}с {fmt:5}"
-        if res_row.get("too_large"):
+        if res_row.get("skipped"):
+            head = head.replace("OK  ", "SKIP")
+            print(f"{head} [{res_row['category']}] ролик недоступен — {row['note']}: {_short(res_row['error'], 60)}")
+        elif res_row.get("too_large"):
             print(f"{head} слишком большой (сработал FileTooLargeError) — {row['note']}")
         elif res_row["ok"]:
             thumb = "превью есть" if res_row["thumb"] else "БЕЗ превью"
@@ -416,12 +422,15 @@ def print_summary(rows: list[dict], downloads: list[dict], env_problems: list[st
 
     dl_fail = 0
     if downloads:
-        dl_ok = sum(1 for d in downloads if d["ok"])
-        dl_fail = len(downloads) - dl_ok
-        no_thumb = sum(1 for d in downloads if d["ok"] and not d.get("too_large") and not d["thumb"])
+        dl_skip = sum(1 for d in downloads if d.get("skipped"))
+        dl_ok = sum(1 for d in downloads if d["ok"]) - dl_skip
+        dl_fail = len(downloads) - dl_ok - dl_skip
+        no_thumb = sum(1 for d in downloads if d.get("size_mb") and not d["thumb"])
         speeds = [d["size_mb"] / d["sec"] for d in downloads if d.get("size_mb") and d["sec"] > 0]
         avg_speed = f", средняя скорость {sum(speeds) / len(speeds):.1f} МБ/с" if speeds else ""
-        print(f"скачивание: {dl_ok}/{len(downloads)} успешно{avg_speed}, без превью: {no_thumb}")
+        skip_txt = f", пропущено (ролик недоступен): {dl_skip}" if dl_skip else ""
+        print(f"скачивание: {dl_ok}/{len(downloads) - dl_skip} успешно{avg_speed}, "
+              f"без превью: {no_thumb}{skip_txt}")
 
     # предупреждения yt-dlp за весь прогон
     warn_counts = {
@@ -429,10 +438,12 @@ def print_summary(rows: list[dict], downloads: list[dict], env_problems: list[st
         for pattern, label in WARNING_PATTERNS.items()
     }
     fallbacks = sum(1 for m in collector.records if "не дал инфо" in m or "не сработал" in m)
+    empty = sum(1 for m in collector.records if "дал инфо без форматов" in m)
     print("\nпредупреждения yt-dlp за прогон:")
     for label, n in warn_counts.items():
         print(f"  {n:4}  {label}")
-    print(f"  {fallbacks:4}  попыток ушло в fallback (первый источник не справился)")
+    print(f"  {fallbacks:4}  попыток упало с ошибкой и ушло в fallback")
+    print(f"  {empty:4}  ответов get_info без форматов (ушли на следующий источник)")
 
     # вердикт
     deploy_broken = (

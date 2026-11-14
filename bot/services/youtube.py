@@ -22,6 +22,18 @@ from bot.config import settings
 
 logger = logging.getLogger(__name__)
 
+
+def _safe_proxy(url: str | None) -> str:
+    """Прокси для лога без логина/пароля: scheme://host:port"""
+    from urllib.parse import urlsplit
+
+    try:
+        p = urlsplit(url or "")
+        return f"{p.scheme}://{p.hostname}:{p.port}" if p.hostname else "задан"
+    except ValueError:
+        return "задан"
+
+
 # лимит файла (Local Bot API — 2 ГБ)
 MAX_FILE_SIZE = settings.max_file_size
 
@@ -284,7 +296,7 @@ class YouTubeDownloader:
                     len(pool), self._warp_primary, ", ".join(pool) or "—")
         if self._proxy:
             role = "fallback" if self._warp_primary else "primary"
-            logger.info("Резидентный прокси (%s): %s", role, self._proxy)
+            logger.info("Резидентный прокси (%s): %s", role, _safe_proxy(self._proxy))
         if settings.bgutil_base_url:
             logger.info("PO-token (bgutil): %s", settings.bgutil_base_url)
         else:
